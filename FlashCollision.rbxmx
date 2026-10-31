@@ -1,0 +1,343 @@
+<?xml version='1.0' encoding='utf-8'?>
+<roblox version="4">
+  <Item class="Script" referent="RBX0">
+    <Properties>
+      <string name="Name">FlashCollision</string>
+      <ProtectedString name="Source">if not plugin then return end
+
+local Selection = game:GetService("Selection")
+local RunService = game:GetService("RunService")
+local ChangeHistoryService = game:GetService("ChangeHistoryService")
+local Ui = require(script.Ui)
+local Adapter = require(script.Adapter)
+local Transaction = require(script.Transaction)
+local panel = Ui.new(plugin, "FlashCollision", "Flash Collision", "Groups")
+local plan = nil
+local status
+local preview
+local function invalidate()
+    plan = nil
+    if status then status.Text = "Selection or options changed. Preview again before applying." end
+    if preview then preview.Text = "" end
+end
+local options = Adapter.controls(panel, invalidate)
+status = panel.label("Select objects in Explorer, then preview the changes.")
+panel.button("Preview selection", function()
+    plan = nil
+    preview.Text = ""
+    if RunService:IsRunning() then status.Text = "Stop the play test first." return end
+    local ok, result = pcall(Adapter.plan, Selection:Get(), options())
+    if not ok then status.Text = tostring(result) return end
+    plan = result
+    status.Text = (plan.summary or string.format("%d changes.", #plan)) .. " Preview shows up to 100 rows. Nothing has been edited."
+    local lines = {}
+    for index, entry in ipairs(plan) do
+        if index &gt; 100 then break end
+        table.insert(lines, entry.label)
+    end
+    preview.Text = table.concat(lines, "\n\n")
+end)
+panel.button("Apply preview", function()
+    if RunService:IsRunning() then invalidate() status.Text = "Stop the play test first." return end
+    if not plan then status.Text = "Preview the selection first." return end
+    local _, message = Transaction.apply(plan, Adapter, {
+        begin = function() return ChangeHistoryService:TryBeginRecording("FlashCollision.Apply", "Flash Collision") end,
+        finish = function(recording, commit)
+            ChangeHistoryService:FinishRecording(recording, if commit then Enum.FinishRecordingOperation.Commit else Enum.FinishRecordingOperation.Cancel)
+        end,
+    })
+    plan = nil
+    status.Text = message
+    preview.Text = ""
+end)
+preview = panel.label("")
+preview.TextSize = 14
+local selectionConnection = Selection.SelectionChanged:Connect(invalidate)
+plugin.Unloading:Connect(function()
+    selectionConnection:Disconnect()
+    panel.destroy()
+end)
+</ProtectedString>
+    </Properties>
+    <Item class="ModuleScript" referent="RBX1">
+      <Properties>
+        <string name="Name">Adapter</string>
+        <ProtectedString name="Source">local Rules = require(script.Parent.Rules)
+local Scope = require(script.Parent.Scope)
+local Adapter = {}
+
+function Adapter.registered()
+    -- Collision groups are per-world in current Studio. Older versions use PhysicsService.
+    local ok, groups = pcall(function() return workspace:GetRegisteredCollisionGroups() end)
+    if not ok then groups = game:GetService("PhysicsService"):GetRegisteredCollisionGroups() end
+    local names = {}
+    for _, group in ipairs(groups) do names[group.name] = true end
+    return names
+end
+
+local function eligible(object)
+    return object:IsA("BasePart") and object:IsDescendantOf(workspace)
+        and object:FindFirstAncestorWhichIsA("WorldRoot") == workspace
+end
+
+function Adapter.controls(panel, changed)
+    panel.label("Assign existing collision groups. This does not change the group's collision rules or create groups.")
+    local group = panel.field("Collision group (exact name)", "Default")
+    local expand = panel.cycle("Scope", { "Selection only", "Include descendants" }, changed)
+    local list = panel.label("")
+    local function refresh()
+        local ok, names = pcall(Adapter.registered)
+        if not ok then list.Text = "Could not read groups: " .. tostring(names) return end
+        local sorted = {}
+        for name in pairs(names) do table.insert(sorted, name) end
+        table.sort(sorted)
+        list.Text = "Registered in Workspace: " .. table.concat(sorted, ", ")
+    end
+    panel.button("Refresh registered groups", function() changed() refresh() end)
+    group:GetPropertyChangedSignal("Text"):Connect(changed)
+    refresh()
+    return function() return { group = group.Text, expand = expand() == "Include descendants" } end
+end
+
+function Adapter.plan(selection, options)
+    local parts, scanned = Scope.collect(selection, options.expand, eligible)
+    local rows = {}
+    for _, part in ipairs(parts) do
+        assert(not part.Locked, "A target part is locked. Unlock it or use a smaller selection.")
+        table.insert(rows, { target = part, parent = part.Parent, group = part.CollisionGroup })
+    end
+    local plan = Rules.plan(rows, options.group, Adapter.registered())
+    plan.summary = string.format("%d changes / %d eligible parts / %d objects scanned.", #plan, #parts, scanned)
+    for _, entry in ipairs(plan) do
+        entry.label = entry.before.target:GetFullName() .. "\n" .. entry.before.group .. " -&gt; " .. entry.after
+    end
+    return plan
+end
+
+function Adapter.validate(plan)
+    local groups = Adapter.registered()
+    for _, entry in ipairs(plan) do
+        local before = entry.before
+        if not groups[entry.after] then return false, "The destination group was removed or renamed. Preview again." end
+        if not eligible(before.target) or before.target.Locked or before.target.Parent ~= before.parent or before.target.CollisionGroup ~= before.group then
+            return false, "A target changed world, parent, lock state or collision group. Preview again."
+        end
+    end
+    return true
+end
+
+function Adapter.write(entry)
+    entry.before.target.CollisionGroup = entry.after
+end
+
+return Adapter
+</ProtectedString>
+      </Properties>
+    </Item>
+    <Item class="ModuleScript" referent="RBX2">
+      <Properties>
+        <string name="Name">Rules</string>
+        <ProtectedString name="Source">local Rules = {}
+
+function Rules.plan(rows, group, registered)
+    assert(#rows &gt; 0 and #rows &lt;= 1000, "Choose between 1 and 1000 eligible parts.")
+    assert(type(group) == "string" and #group &gt; 0 and #group &lt;= 100 and utf8.len(group) and group:match("%S") and not group:find("%c"), "Enter an exact collision-group name, up to 100 UTF-8 bytes, without control characters.")
+    assert(registered[group] == true, "That group is not registered in Workspace. Create it with Studio's collision-group editor first.")
+    local plan = {}
+    for _, row in ipairs(rows) do
+        if row.group ~= group then table.insert(plan, { before = row, after = group }) end
+    end
+    return plan
+end
+
+return Rules
+</ProtectedString>
+      </Properties>
+    </Item>
+    <Item class="ModuleScript" referent="RBX3">
+      <Properties>
+        <string name="Name">Scope</string>
+        <ProtectedString name="Source">local Scope = {}
+
+function Scope.collect(roots, expand, predicate, limits)
+    limits = limits or { maxNodes = 5000, maxTargets = 1000, allowServices = false }
+    assert(#roots &gt; 0 and #roots &lt;= 500, "Choose between 1 and 500 selection roots.")
+    local queued, stack, targets = {}, {}, {}
+    local discovered = 0
+    local function enqueue(object)
+        if queued[object] then return end
+        discovered += 1
+        assert(discovered &lt;= limits.maxNodes, "Scope exceeds " .. limits.maxNodes .. " objects. Select a smaller area.")
+        queued[object] = true
+        table.insert(stack, object)
+    end
+    for index = #roots, 1, -1 do
+        local object = roots[index]
+        assert(object.Parent and object:IsDescendantOf(game), "Selection contains a detached object.")
+        assert(limits.allowServices or object.Parent ~= game, "Select objects inside a service, not the service itself.")
+        enqueue(object)
+    end
+    while #stack &gt; 0 do
+        local object = table.remove(stack)
+        if predicate(object) then
+            assert(#targets &lt; limits.maxTargets, "More than " .. limits.maxTargets .. " targets. Select a smaller area.")
+            table.insert(targets, object)
+        end
+        if expand then
+            local children = object:GetChildren()
+            for index = #children, 1, -1 do enqueue(children[index]) end
+        end
+    end
+    return targets, discovered
+end
+
+return Scope
+</ProtectedString>
+      </Properties>
+    </Item>
+    <Item class="ModuleScript" referent="RBX4">
+      <Properties>
+        <string name="Name">Transaction</string>
+        <ProtectedString name="Source">local Transaction = {}
+
+function Transaction.apply(plan, adapter, history)
+    if #plan == 0 then return false, "Nothing to change." end
+    local checked, valid, reason = pcall(adapter.validate, plan)
+    if not checked then return false, "The preview could not be checked. Preview again: " .. tostring(valid) end
+    if not valid then return false, reason end
+    local started, recording = pcall(history.begin)
+    if not started or not recording then
+        return false, "Studio could not start an undo recording. Try again in edit mode."
+    end
+    local ok, err = pcall(function()
+        for _, entry in ipairs(plan) do adapter.write(entry) end
+    end)
+    if ok then
+        ok, err = pcall(history.finish, recording, true)
+    end
+    if not ok then
+        local cancelled = pcall(history.finish, recording, false)
+        if not cancelled then
+            return false, "The edit failed and Studio could not cancel its recording. Check the place and undo history: " .. tostring(err)
+        end
+        return false, "The batch was cancelled: " .. tostring(err)
+    end
+    return true, string.format("Applied %d changes. Use Studio Undo to revert the batch.", #plan)
+end
+
+return Transaction
+</ProtectedString>
+      </Properties>
+    </Item>
+    <Item class="ModuleScript" referent="RBX5">
+      <Properties>
+        <string name="Name">Ui</string>
+        <ProtectedString name="Source">local Ui = {}
+
+function Ui.new(plugin, id, title, action)
+    local studio = settings().Studio
+    local colors = {}
+    local connections = {}
+    local toolbar = plugin:CreateToolbar(title)
+    local toggle = toolbar:CreateButton(id, title, "", action)
+    local widget = plugin:CreateDockWidgetPluginGuiAsync(id .. "_v1", DockWidgetPluginGuiInfo.new(
+        Enum.InitialDockState.Right, false, false, 380, 600, 280, 260
+    ))
+    widget.Title = title
+    local scroll = Instance.new("ScrollingFrame")
+    scroll.Size = UDim2.fromScale(1, 1)
+    scroll.BorderSizePixel = 0
+    scroll.ScrollBarThickness = 6
+    scroll.CanvasSize = UDim2.new()
+    scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    scroll.ScrollingDirection = Enum.ScrollingDirection.Y
+    scroll.Parent = widget
+    local padding = Instance.new("UIPadding")
+    padding.PaddingTop = UDim.new(0, 14)
+    padding.PaddingBottom = UDim.new(0, 14)
+    padding.PaddingLeft = UDim.new(0, 14)
+    padding.PaddingRight = UDim.new(0, 20)
+    padding.Parent = scroll
+    local layout = Instance.new("UIListLayout")
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+    layout.Padding = UDim.new(0, 9)
+    layout.Parent = scroll
+    local order = 0
+    local function theme(object, property, color)
+        table.insert(colors, { object, property, color })
+        object[property] = studio.Theme:GetColor(Enum.StudioStyleGuideColor[color])
+    end
+    theme(scroll, "BackgroundColor3", "MainBackground")
+    theme(scroll, "ScrollBarImageColor3", "MainText")
+    local function add(class, text)
+        order = order + 1
+        local object = Instance.new(class)
+        object.LayoutOrder = order
+        object.Size = UDim2.new(1, 0, 0, 32)
+        object.BorderSizePixel = 0
+        object.Font = Enum.Font.SourceSans
+        object.TextSize = 16
+        object.Text = text
+        object.TextWrapped = true
+        object.Parent = scroll
+        theme(object, "TextColor3", "MainText")
+        return object
+    end
+    local panel = { widget = widget }
+    function panel.label(text)
+        local object = add("TextLabel", text)
+        object.Size = UDim2.new(1, 0, 0, 0)
+        object.AutomaticSize = Enum.AutomaticSize.Y
+        object.BackgroundTransparency = 1
+        object.TextXAlignment = Enum.TextXAlignment.Left
+        return object
+    end
+    function panel.field(caption, initial)
+        panel.label(caption)
+        local object = add("TextBox", initial)
+        object.ClearTextOnFocus = false
+        object.TextWrapped = false
+        theme(object, "BackgroundColor3", "InputFieldBackground")
+        return object
+    end
+    function panel.button(text, callback)
+        local object = add("TextButton", text)
+        theme(object, "BackgroundColor3", "Button")
+        table.insert(connections, object.Activated:Connect(callback))
+        return object
+    end
+    function panel.cycle(caption, choices, changed)
+        local index = 1
+        local button
+        button = panel.button(caption .. ": " .. choices[index], function()
+            index = index % #choices + 1
+            button.Text = caption .. ": " .. choices[index]
+            changed()
+        end)
+        return function() return choices[index] end
+    end
+    panel.label(title)
+    table.insert(connections, toggle.Click:Connect(function() widget.Enabled = not widget.Enabled end))
+    table.insert(connections, widget:GetPropertyChangedSignal("Enabled"):Connect(function()
+        toggle:SetActive(widget.Enabled)
+    end))
+    table.insert(connections, studio.ThemeChanged:Connect(function()
+        for _, item in ipairs(colors) do
+            item[1][item[2]] = studio.Theme:GetColor(Enum.StudioStyleGuideColor[item[3]])
+        end
+    end))
+    toggle:SetActive(widget.Enabled)
+    function panel.destroy()
+        for _, connection in ipairs(connections) do connection:Disconnect() end
+        widget:Destroy()
+        toolbar:Destroy()
+    end
+    return panel
+end
+
+return Ui
+</ProtectedString>
+      </Properties>
+    </Item>
+  </Item>
+</roblox>
